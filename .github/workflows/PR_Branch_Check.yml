@@ -1,9 +1,5 @@
 name: PR Branch Check
 
-on:
-  # Using pull_request_target instead of pull_request for secure handling of fork PRs
-
-
 permissions:
   pull-requests: write
   issues: write
