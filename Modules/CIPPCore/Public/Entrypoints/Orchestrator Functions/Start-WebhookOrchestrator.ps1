@@ -28,10 +28,10 @@ function Start-WebhookOrchestrator {
                 FunctionName = 'GetPendingWebhooks'
             }
             SkipLog          = $true
+            AllowCollision   = $false
         }
         if ($PSCmdlet.ShouldProcess('Start-WebhookOrchestrator', 'Starting Webhook Orchestrator')) {
-            Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
-
+            Start-CIPPOrchestrator -InputObject $InputObject
         }
     } catch {
         Write-LogMessage -API 'Webhooks' -message 'Error processing webhooks' -sev Error -LogData (Get-CippException -Exception $_)

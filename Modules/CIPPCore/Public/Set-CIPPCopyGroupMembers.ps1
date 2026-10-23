@@ -6,7 +6,9 @@ function Set-CIPPCopyGroupMembers {
         [string]$CopyFromId,
         [string]$TenantFilter,
         [string]$APIName = 'Copy User Groups',
-        [switch]$ExchangeOnly
+        [switch]$ExchangeOnly,
+        # For a brand-new user: Exchange is not ready for the recipient yet, so queue those adds instead.
+        [switch]$DeferExchange
     )
 
     $Requests = @(
@@ -40,16 +42,50 @@ function Set-CIPPCopyGroupMembers {
 
     $Success = [System.Collections.Generic.List[object]]::new()
     $Errors = [System.Collections.Generic.List[object]]::new()
-    $Memberships = $CopyFromMemberships | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.group' -and
-        $_.groupTypes -notcontains 'DynamicMembership' -and
-        $_.onPremisesSyncEnabled -ne $true -and
-        $_.visibility -ne 'Public' -and
-        $CurrentMemberships.id -notcontains $_.id }
+    $Skipped = [System.Collections.Generic.List[object]]::new()
+
+    # Not every membership can or should be copied, but a group that is quietly dropped looks
+    # identical to one the copy simply missed - so say which ones were left out and why. The three
+    # policy skips are reported per group because they are the surprising ones; groups the target
+    # already belongs to are summarised on one line instead, since a copy between two long-standing
+    # colleagues would otherwise bury the real outcome under dozens of unremarkable lines.
+    $AlreadyMember = [System.Collections.Generic.List[string]]::new()
+    $Memberships = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($Group in @($CopyFromMemberships | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.group' })) {
+        $GroupLabel = if ([string]::IsNullOrWhiteSpace($Group.displayName)) { $Group.id } else { $Group.displayName }
+        if ($Group.groupTypes -contains 'DynamicMembership') {
+            $Skipped.Add("Skipped $($GroupLabel): its membership is set by a dynamic rule, so members cannot be added directly.")
+        } elseif ($Group.onPremisesSyncEnabled -eq $true) {
+            $Skipped.Add("Skipped $($GroupLabel): it is synced from on-premises Active Directory and has to be changed there.")
+        } elseif ($Group.visibility -eq 'Public') {
+            $Skipped.Add("Skipped $($GroupLabel): it is a public group, which users can join themselves.")
+        } elseif ($CurrentMemberships.id -contains $Group.id) {
+            $AlreadyMember.Add($GroupLabel)
+        } else {
+            $Memberships.Add($Group)
+        }
+    }
+
+    if ($AlreadyMember.Count -gt 0) {
+        $Plural = if ($AlreadyMember.Count -eq 1) { 'group' } else { 'groups' }
+        $Skipped.Add("Already a member of $($AlreadyMember.Count) $($Plural), left unchanged: $($AlreadyMember -join ', ').")
+    }
+
+    foreach ($SkipMessage in $Skipped) {
+        Write-LogMessage -headers $Headers -API $APIName -message $SkipMessage -Sev 'Info' -tenant $TenantFilter
+    }
+
     $ScheduleExchangeGroupTask = $false
+    $DeferredExchangeGroups = [System.Collections.Generic.List[string]]::new()
     foreach ($MailGroup in $Memberships) {
         try {
             if ($PSCmdlet.ShouldProcess($MailGroup.displayName, "Add $UserId to group")) {
                 if ($MailGroup.MailEnabled -and $MailGroup.ResourceProvisioningOptions -notcontains 'Team' -and $MailGroup.groupTypes -notcontains 'Unified') {
+                    if ($DeferExchange.IsPresent -and !$ExchangeOnly.IsPresent) {
+                        $DeferredExchangeGroups.Add($MailGroup.displayName)
+                        continue
+                    }
                     $Params = @{ Identity = $MailGroup.id; Member = $UserId; BypassSecurityGroupManagerCheck = $true }
                     try {
                         $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Add-DistributionGroupMember' -cmdParams $params -UseSystemMailbox $true
@@ -102,9 +138,43 @@ function Set-CIPPCopyGroupMembers {
         }
     }
 
+    if ($DeferredExchangeGroups.Count -gt 0) {
+        $GroupList = $DeferredExchangeGroups -join ', '
+        try {
+            $TaskBody = [PSCustomObject]@{
+                TenantFilter  = $TenantFilter
+                Name          = "Copy Exchange Group Membership: $UserId from $CopyFromId"
+                Command       = @{
+                    value = 'Set-CIPPCopyGroupMembers'
+                }
+                Parameters    = [PSCustomObject]@{
+                    UserId       = $UserId
+                    CopyFromId   = $CopyFromId
+                    TenantFilter = $TenantFilter
+                    ExchangeOnly = $true
+                }
+                ScheduledTime = [int64](([datetime]::UtcNow).AddMinutes(15) - (Get-Date '1/1/1970')).TotalSeconds
+                PostExecution = @{
+                    Webhook = $false
+                    Email   = $false
+                    PSA     = $false
+                }
+            }
+            $ScheduleResult = Add-CIPPScheduledTask -Task $TaskBody -hidden $false -Headers $Headers
+            if ($ScheduleResult -like 'Successfully added task:*') {
+                $Success.Add("Scheduled adding $UserId to the Exchange groups $GroupList in 15 minutes, once Exchange has provisioned the mailbox.")
+            } else {
+                $Errors.Add("Failed to schedule adding $UserId to the Exchange groups $($GroupList): $ScheduleResult")
+            }
+        } catch {
+            $Errors.Add("Failed to schedule adding $UserId to the Exchange groups $($GroupList): $($_.Exception.Message)")
+        }
+    }
+
     $Results = [PSCustomObject]@{
         'Success' = $Success
         'Error'   = $Errors
+        'Skipped' = $Skipped
     }
 
     return @($Results)

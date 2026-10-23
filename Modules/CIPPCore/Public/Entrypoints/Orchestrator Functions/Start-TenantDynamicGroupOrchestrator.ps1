@@ -27,11 +27,12 @@ function Start-TenantDynamicGroupOrchestrator {
             $TenantBatch = $TenantGroups | Select-Object Name, Id, @{n = 'FunctionName'; exp = { 'UpdateDynamicTenantGroup' } }, @{n = 'QueueId'; exp = { $Queue.RowKey } }
             $InputObject = [PSCustomObject]@{
                 OrchestratorName = 'UpdateDynamicTenantGroups'
+                AllowCollision   = $GroupId -ne 'All'
                 Batch            = @($TenantBatch)
                 SkipLog          = $true
             }
             if ($PSCmdlet.ShouldProcess('Start-TenantDynamicGroupOrchestrator', 'Starting Tenant Dynamic Group Orchestrator')) {
-                Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+                Start-CIPPOrchestrator -InputObject $InputObject
             }
         } else {
             Write-Information 'No tenants require permissions update'

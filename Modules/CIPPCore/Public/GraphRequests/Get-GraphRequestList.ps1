@@ -57,6 +57,15 @@ function Get-GraphRequestList {
     .PARAMETER UseBatchExpand
     Perform a batch lookup using the $expand query parameter to avoid 20 item max
 
+    .PARAMETER FillMissing
+    AllTenants: queue only the tenants missing from the cache, serving the cached rows meanwhile
+
+    .PARAMETER RefreshCache
+    AllTenants: queue every tenant again even though a cache exists, serving the cached rows until each is replaced
+
+    .PARAMETER CacheStatus
+    AllTenants: filled with CachedTenants, ExpectedTenants and the QueueId of the run filling the cache, if any
+
     #>
     [CmdletBinding()]
     param(
@@ -80,14 +89,27 @@ function Get-GraphRequestList {
         [string]$ReverseTenantLookupProperty = 'tenantId',
         [boolean]$AsApp = $false,
         [string]$Caller = 'Get-GraphRequestList',
-        [switch]$UseBatchExpand
+        [switch]$UseBatchExpand,
+        [switch]$RawJsonArray,
+        [int]$MaxPageBytes,
+        [switch]$FillMissing,
+        [switch]$RefreshCache,
+        [hashtable]$CacheStatus
     )
 
     $SingleTenantThreshold = 8000
+    $PagedAllTenants = $false
     Write-Information "Tenant: $TenantFilter"
     $TableName = ('cache{0}' -f ($Endpoint -replace '[^A-Za-z0-9]'))[0..62] -join ''
     $Endpoint = $Endpoint -replace '^/', ''
     $DisplayName = ($Endpoint -split '/')[0]
+
+    # @odata.count is only returned when the request carries $count=true, so a CountOnly caller
+    # that did not also pass $count got a response with no count and CountOnly returned $null.
+    # Add it here (ConsistencyLevel:eventual is set via ComplexFilter on the count request below).
+    if ($CountOnly.IsPresent -and -not $Parameters.ContainsKey('$count')) {
+        $Parameters['$count'] = 'true'
+    }
 
     if ($QueueNameOverride) {
         $QueueName = $QueueNameOverride
@@ -97,6 +119,19 @@ function Get-GraphRequestList {
     }
 
     $GraphQuery = [System.UriBuilder]('https://graph.microsoft.com/{0}/{1}' -f $Version, $Endpoint)
+
+    # Resolve variable placeholders in Parameters before building the query string.
+    # Supported: {DaysAgo:N} → ISO 8601 date N days in the past (UTC)
+    $Keys = @($Parameters.Keys)
+    foreach ($Key in $Keys) {
+        if ($Parameters[$Key] -is [string]) {
+            $Parameters[$Key] = [regex]::Replace($Parameters[$Key], '\{DaysAgo:(\d+)\}', {
+                    param($m)
+                    (Get-Date).ToUniversalTime().AddDays( - [int]$m.Groups[1].Value).ToString('yyyy-MM-dd')
+                })
+        }
+    }
+
     $ParamCollection = [System.Web.HttpUtility]::ParseQueryString([String]::Empty)
     foreach ($Item in ($Parameters.GetEnumerator() | Sort-Object -CaseSensitive -Property Key)) {
         if ($Item.Value -is [System.Boolean]) {
@@ -121,6 +156,10 @@ function Get-GraphRequestList {
         }
     }
     $GraphQuery.Query = $ParamCollection.ToString()
+    Test-CIPPGraphEndpointBlocked -Uri $GraphQuery.ToString() -Expand $BatchExpandQuery -Throw
+    if ($nextLink -match '^https://') {
+        Test-CIPPGraphEndpointBlocked -Uri $nextLink -Throw
+    }
     $PartitionKey = Get-StringHash -String (@($Endpoint, $ParamCollection.ToString(), 'v2') -join '-')
 
     # Perform $count check before caching
@@ -164,12 +203,16 @@ function Get-GraphRequestList {
             }
             $GraphQuery.Query = $ParamCollection.ToString()
             $GraphRequest.uri = $GraphQuery.ToString()
+            Test-CIPPGraphEndpointBlocked -Uri $GraphRequest.uri -Throw
         }
 
-        if ($Parameters.'$count' -and !$SkipCache.IsPresent -and !$NoPagination.IsPresent) {
+        if ($Parameters.'$count' -and -not $ManualPagination.IsPresent) {
             $Count = New-GraphGetRequest @GraphRequest -CountOnly -ErrorAction Stop
             if ($CountOnly.IsPresent) { return $Count }
             Write-Information "Total results (`$count): $Count"
+        } elseif ($CountOnly.IsPresent) {
+            $Count = New-GraphGetRequest @GraphRequest -CountOnly -ErrorAction Stop
+            return $Count
         }
     }
     #Write-Information ( 'GET [ {0} ]' -f $GraphQuery.ToString())
@@ -182,7 +225,7 @@ function Get-GraphRequestList {
             $Type = 'Queue'
             Write-Information "Cached: $(($Rows | Measure-Object).Count) rows (Type: $($Type))"
             $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-            $RunningQueue = Invoke-ListCippQueue -Reference $QueueReference | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' }
+            $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -ne 'Completed' -and $_.Status -ne 'Failed' -and $_.Reference -eq $QueueReference }
         } elseif (!$SkipCache.IsPresent -and !$ClearCache.IsPresent -and !$CountOnly.IsPresent) {
             if ($TenantFilter -eq 'AllTenants' -or $Count -gt $SingleTenantThreshold) {
                 $Table = Get-CIPPTable -TableName $TableName
@@ -193,15 +236,96 @@ function Get-GraphRequestList {
                     $Filter = "PartitionKey eq '{0}' and (RowKey eq '{1}' or OriginalEntityId eq '{1}') and Timestamp ge datetime'{2}'" -f $PartitionKey, $TenantFilter, $Timestamp
                 }
                 $Tenants = Get-Tenants -IncludeErrors
-                $Rows = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object { $_.OriginalEntityId -in $Tenants.defaultDomainName -or $_.RowKey -in $Tenants.defaultDomainName }
+                # Paged AllTenants serve: key scan here, bounded blob fetches in the serve branch.
+                $PagedAllTenants = $TenantFilter -eq 'AllTenants' -and $ManualPagination.IsPresent -and $RawJsonArray.IsPresent
+                if ($PagedAllTenants) {
+                    # Keys only, and none of the split-entity markers: projecting a subset of them
+                    # (e.g. OriginalEntityId alone) makes reassembly fail and drops split tenants.
+                    $KeyRows = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
+                    # Physical rows per tenant ('-part<n>' rows fold into their head); sizes the spans below.
+                    $PagedTenantRowCounts = [System.Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+                    foreach ($KeyRow in @($KeyRows)) {
+                        $TenantKey = [string]$KeyRow.RowKey -replace '-part\d+$', ''
+                        if ($TenantKey) {
+                            $PagedTenantRowCounts[$TenantKey] = 1 + $(if ($PagedTenantRowCounts.ContainsKey($TenantKey)) { $PagedTenantRowCounts[$TenantKey] } else { 0 })
+                        }
+                    }
+                    # Ordinal, to match the resume comparison below (a culture sort re-served tenants).
+                    $PagedTenantPlan = [string[]]@($PagedTenantRowCounts.Keys | Where-Object { $_ -in $Tenants.defaultDomainName })
+                    [System.Array]::Sort($PagedTenantPlan, [System.Collections.IComparer][StringComparer]::Ordinal)
+                    # $Rows gates queue-vs-serve below; an empty plan queues like an empty fetch.
+                    $Rows = $PagedTenantPlan
+                } else {
+                    $Rows = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object { $_.OriginalEntityId -in $Tenants.defaultDomainName -or $_.RowKey -in $Tenants.defaultDomainName }
+                }
                 $Type = 'Cache'
                 Write-Information "Table: $TableName | PK: $PartitionKey | Cached: $(($Rows | Measure-Object).Count) rows (Type: $($Type))"
                 $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-                $RunningQueue = Invoke-ListCippQueue -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
+                $RunningQueue = Get-CIPPQueueData -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' -and $_.Reference -eq $QueueReference }
             }
         }
     } catch {
         Write-Information $_.InvocationInfo.PositionMessage
+    }
+
+    $RunningQueueId = if ($RunningQueue) { @($RunningQueue)[0].QueueId ?? @($RunningQueue)[0].RowKey }
+
+    # An AllTenants cache holds one row per tenant, written even when the tenant fails, so a tenant without a row has not finished.
+    $StartedQueueId = $null
+    if ($TenantFilter -eq 'AllTenants' -and !$SkipCache.IsPresent) {
+        $Tenants ??= Get-Tenants -IncludeErrors
+        $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
+        $CachedTenants = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($Row in $Rows) {
+            [void]$CachedTenants.Add([string]$(if ($PagedAllTenants) { $Row } elseif ($Row.OriginalEntityId) { $Row.OriginalEntityId } else { $Row.RowKey }))
+        }
+        $QueueTenants = @()
+        if (-not $RunningQueue) {
+            # A page continuation repeats the first page's flags; only the first page acts on them.
+            if (!$Rows -or ($RefreshCache.IsPresent -and !$nextLink)) {
+                $QueueTenants = @($Tenants)
+                $QueueLabel = "$QueueName (All Tenants)"
+            } elseif ($FillMissing.IsPresent -and !$nextLink) {
+                $QueueTenants = @($Tenants.Where({ -not $CachedTenants.Contains($_.defaultDomainName) }))
+                $QueueLabel = "$QueueName ($($QueueTenants.Count) missing tenants)"
+            }
+        }
+        if ($QueueTenants.Count -gt 0) {
+            $Queue = New-CippQueueEntry -Name $QueueLabel -Link $CippLink -Reference $QueueReference -TotalTasks $QueueTenants.Count
+            $StartedQueueId = $Queue.RowKey
+            try {
+                $Batch = foreach ($QueueTenant in $QueueTenants) {
+                    [PSCustomObject]@{
+                        FunctionName                = 'ListGraphRequestQueue'
+                        TenantFilter                = $QueueTenant.defaultDomainName
+                        Endpoint                    = $Endpoint
+                        QueueId                     = $Queue.RowKey
+                        QueueName                   = $QueueTenant.defaultDomainName
+                        QueueType                   = 'AllTenants'
+                        Parameters                  = $Parameters
+                        PartitionKey                = $PartitionKey
+                        NoPagination                = $NoPagination.IsPresent
+                        NoAuthCheck                 = $NoAuthCheck.IsPresent
+                        AsApp                       = $AsApp
+                        ReverseTenantLookupProperty = $ReverseTenantLookupProperty
+                        ReverseTenantLookup         = $ReverseTenantLookup.IsPresent
+                    }
+                }
+                $InputObject = @{
+                    OrchestratorName = 'GraphRequestOrchestrator'
+                    Batch            = @($Batch)
+                    Reference        = $QueueReference
+                }
+                $null = Start-CIPPOrchestrator -InputObject $InputObject
+            } catch {
+                Write-Information "QUEUE ERROR: $($_.Exception.Message)"
+            }
+        }
+        if ($null -ne $CacheStatus) {
+            $CacheStatus.CachedTenants = $CachedTenants.Count
+            $CacheStatus.ExpectedTenants = @($Tenants).Count
+            $CacheStatus.QueueId = $StartedQueueId ?? $RunningQueueId
+        }
     }
 
     if (!$Rows) {
@@ -236,53 +360,10 @@ function Get-GraphRequestList {
                         }
                     }
                 } else {
-                    if ($RunningQueue) {
-                        Write-Information 'Queue currently running'
-                        Write-Information ($RunningQueue | ConvertTo-Json)
-                        [PSCustomObject]@{
-                            QueueMessage = 'Data still processing, please wait'
-                            QueueId      = $RunningQueue.RowKey
-                            Queued       = $true
-                        }
-                    } else {
-                        $TenantList = Get-Tenants -IncludeErrors
-                        $Queue = New-CippQueueEntry -Name "$QueueName (All Tenants)" -Link $CippLink -Reference $QueueReference -TotalTasks ($TenantList | Measure-Object).Count
-                        [PSCustomObject]@{
-                            QueueMessage = 'Loading data for all tenants. Please check back after the job completes'
-                            Queued       = $true
-                            QueueId      = $Queue.RowKey
-                        }
-                        Write-Information 'Pushing output bindings'
-                        try {
-                            $Batch = $TenantList | ForEach-Object {
-                                $TenantFilter = $_.defaultDomainName
-                                [PSCustomObject]@{
-                                    FunctionName                = 'ListGraphRequestQueue'
-                                    TenantFilter                = $TenantFilter
-                                    Endpoint                    = $Endpoint
-                                    QueueId                     = $Queue.RowKey
-                                    QueueName                   = $TenantFilter
-                                    QueueType                   = 'AllTenants'
-                                    Parameters                  = $Parameters
-                                    PartitionKey                = $PartitionKey
-                                    NoPagination                = $NoPagination.IsPresent
-                                    NoAuthCheck                 = $NoAuthCheck.IsPresent
-                                    AsApp                       = $AsApp
-                                    ReverseTenantLookupProperty = $ReverseTenantLookupProperty
-                                    ReverseTenantLookup         = $ReverseTenantLookup.IsPresent
-                                }
-
-                            }
-
-                            $InputObject = @{
-                                OrchestratorName = 'GraphRequestOrchestrator'
-                                Batch            = @($Batch)
-                            }
-                            #Write-Information  ($InputObject | ConvertTo-Json -Depth 5)
-                            $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
-                        } catch {
-                            Write-Information "QUEUE ERROR: $($_.Exception.Message)"
-                        }
+                    [PSCustomObject]@{
+                        QueueMessage = if ($StartedQueueId) { 'Loading data for all tenants. Please check back after the job completes' } else { 'Data still processing, please wait' }
+                        QueueId      = $StartedQueueId ?? $RunningQueueId
+                        Queued       = $true
                     }
                 }
             }
@@ -298,7 +379,7 @@ function Get-GraphRequestList {
                                 Write-Information ($RunningQueue | ConvertTo-Json)
                                 [PSCustomObject]@{
                                     QueueMessage = 'Data still processing, please wait'
-                                    QueueId      = $RunningQueue.RowKey
+                                    QueueId      = $RunningQueueId
                                     Queued       = $true
                                 }
                             } else {
@@ -321,7 +402,7 @@ function Get-GraphRequestList {
                                     OrchestratorName = 'GraphRequestOrchestrator'
                                     Batch            = @($QueueTenant)
                                 }
-                                $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+                                $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
 
                                 [PSCustomObject]@{
                                     QueueMessage = ('Loading {0} rows for {1}. Please check back after the job completes' -f $Count, $TenantFilter)
@@ -334,7 +415,17 @@ function Get-GraphRequestList {
 
                     if (!$QueueThresholdExceeded) {
                         #nextLink should ONLY be used in direct calls with manual pagination. It should not be used in queueing
-                        if ($ManualPagination.IsPresent -and $nextLink -match '^https://.+') { $GraphRequest.uri = $nextLink }
+                        if ($ManualPagination.IsPresent -and $nextLink -match '^https://.+') {
+                            try {
+                                $ParsedNextLink = [System.Uri]$nextLink
+                                if ($ParsedNextLink.Host -ne 'graph.microsoft.com') {
+                                    throw "Invalid nextLink host: $($ParsedNextLink.Host)"
+                                }
+                            } catch {
+                                throw "Invalid nextLink URL: $nextLink"
+                            }
+                            $GraphRequest.uri = $nextLink
+                        }
 
                         $GraphRequestResults = New-GraphGetRequest @GraphRequest -Caller $Caller -ErrorAction Stop
                         $GraphRequestResults = $GraphRequestResults | Select-Object *, @{n = 'Tenant'; e = { $TenantFilter } }, @{n = 'CippStatus'; e = { 'Good' } }
@@ -407,6 +498,92 @@ function Get-GraphRequestList {
             }
         }
     } else {
+        if ($RawJsonArray.IsPresent) {
+            if ($PagedAllTenants) {
+                # One page of whole tenant blobs, ended by the byte budget alone (never a tenant
+                # count); tenants are fetched in RowKey-range spans so split blobs reassemble.
+                $MaxPageChars = if ($MaxPageBytes -gt 0) { [Math]::Min([Math]::Max($MaxPageBytes, 262144), 8388608) } else { 4000000 }
+                # Rows are <= ~1MB each, so a row cap bounds a span's worst-case fetch.
+                $SpanRowCap = 40
+                $StartAfter = if ($nextLink) { $nextLink } else { $null }
+
+                $Remaining = [System.Collections.Generic.List[string]]::new()
+                foreach ($TenantKey in $PagedTenantPlan) {
+                    if (-not $StartAfter -or [string]::CompareOrdinal($TenantKey, $StartAfter) -gt 0) { $Remaining.Add($TenantKey) }
+                }
+
+                $JsonParts = [System.Collections.Generic.List[string]]::new()
+                $Chars = 0
+                $Queries = 0
+                $LastEmitted = $null
+                $BudgetReached = $false
+                $Index = 0
+                while ($Index -lt $Remaining.Count -and -not $BudgetReached) {
+                    # Build the next span: consecutive plan tenants until the row cap fills.
+                    $SpanStart = $Index
+                    $SpanRows = 0
+                    $SpanSet = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                    while ($Index -lt $Remaining.Count) {
+                        $Candidate = $Remaining[$Index]
+                        $CandidateRows = $PagedTenantRowCounts[$Candidate]
+                        if ($SpanSet.Count -gt 0 -and ($SpanRows + $CandidateRows) -gt $SpanRowCap) { break }
+                        $null = $SpanSet.Add($Candidate)
+                        $SpanRows += $CandidateRows
+                        $Index++
+                    }
+                    $SpanFirst = ConvertTo-CIPPODataFilterValue -Value $Remaining[$SpanStart] -Type String
+                    $SpanLast = ConvertTo-CIPPODataFilterValue -Value $Remaining[$Index - 1] -Type String
+                    # le '<last>~' keeps the last tenant's '-partN' rows in range; non-member rows
+                    # the range also catches are dropped below.
+                    $SpanFilter = "PartitionKey eq '{0}' and RowKey ge '{1}' and RowKey le '{2}~' and Timestamp ge datetime'{3}'" -f $PartitionKey, $SpanFirst, $SpanLast, $Timestamp
+                    # Budget is enforced per whole tenant; the rest of a span past it is discarded
+                    # and re-fetched by the next page.
+                    $SpanData = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+                    foreach ($Row in @(Get-CIPPAzDataTableEntity @Table -Filter $SpanFilter)) {
+                        if ($SpanSet.Contains([string]$Row.RowKey)) { $SpanData[[string]$Row.RowKey] = $Row }
+                    }
+                    # Emit in plan order: the store's row order is not ordinal (Azurite), and the token resumes by plan order.
+                    for ($SpanIndex = $SpanStart; $SpanIndex -lt $Index -and -not $BudgetReached; $SpanIndex++) {
+                        $LastEmitted = $Remaining[$SpanIndex]
+                        $Row = $null
+                        if (-not $SpanData.TryGetValue($LastEmitted, [ref]$Row)) { continue }
+                        if ($Row.Data) {
+                            $d = $Row.Data.Trim()
+                            if ($d.Length -gt 2 -and $d[0] -eq '[' -and $d[-1] -eq ']') {
+                                $JsonParts.Add($d.Substring(1, $d.Length - 2))
+                                $Chars += $d.Length
+                            } elseif ($d.Length -gt 0 -and $d -ne '[]') {
+                                $JsonParts.Add($d)
+                                $Chars += $d.Length
+                            }
+                        }
+                        if ($Chars -ge $MaxPageChars) { $BudgetReached = $true }
+                    }
+                    $Queries++
+                }
+                # A drained plan is complete even if the last tenant landed on the budget.
+                $MoreRemain = $BudgetReached -and $null -ne $LastEmitted -and [string]::CompareOrdinal($LastEmitted, $Remaining[$Remaining.Count - 1]) -lt 0
+                Write-Information "Paged AllTenants cache serve: $Queries spans, $Chars chars, last: $LastEmitted, more: $MoreRemain"
+                return [PSCustomObject]@{
+                    CippPagedJson = '[' + ($JsonParts -join ',') + ']'
+                    CippNextLink  = if ($MoreRemain) { $LastEmitted } else { $null }
+                }
+            }
+            # Fast path: concatenate raw JSON strings without deserialization. This is much faster and uses less memory when no post-processing is needed, especially for large datasets.
+            $JsonParts = [System.Collections.Generic.List[string]]::new()
+            foreach ($Row in $Rows) {
+                if ($Row.Data) {
+                    $d = $Row.Data.Trim()
+                    if ($d.Length -gt 2 -and $d[0] -eq '[' -and $d[-1] -eq ']') {
+                        $JsonParts.Add($d.Substring(1, $d.Length - 2))
+                    } elseif ($d.Length -gt 0 -and $d -ne '[]') {
+                        $JsonParts.Add($d)
+                    }
+                }
+            }
+            return '[' + ($JsonParts -join ',') + ']'
+        }
+
         foreach ($Row in $Rows) {
             if ($Row.Data) {
                 try {

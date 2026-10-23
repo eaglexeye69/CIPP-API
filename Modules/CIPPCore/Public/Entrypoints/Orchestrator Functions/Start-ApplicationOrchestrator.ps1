@@ -4,12 +4,15 @@ function Start-ApplicationOrchestrator {
     Entrypoint
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
-    Param()
+    Param(
+        [switch]$AllowCollision
+    )
 
     Write-LogMessage -API 'IntuneApps' -message 'Started uploading applications to tenants' -sev Info
     Write-Information 'Started uploading applications to tenants'
     $InputObject = [PSCustomObject]@{
         OrchestratorName = 'ApplicationOrchestrator'
+        AllowCollision   = $AllowCollision.IsPresent
         SkipLog          = $true
         QueueFunction    = @{
             FunctionName = 'GetApplicationQueue'
@@ -17,6 +20,6 @@ function Start-ApplicationOrchestrator {
     }
 
     if ($PSCmdlet.ShouldProcess('Upload Applications')) {
-        return Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Compress -Depth 5)
+        return Start-CIPPOrchestrator -InputObject $InputObject
     }
 }
